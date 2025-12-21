@@ -29,6 +29,11 @@ func (c *Call) GetNum1() int {
 	return c.Num1
 }
 
+func GetNum(a int) int {
+	fmt.Println("GetNum:", a)
+	return 1000 + a
+}
+
 func main() {
 
 	call := &Call{Num1: 10, Num2: 20}
@@ -41,7 +46,12 @@ func main() {
 	L.SetGlobal(call, callx)
 	// global module "require"
 	L.Module(t)
+	// global function
+	L.SetFunction(GetNum)
 
+	fmt.Println("-------")
+	L.DoString("print(GetNum(100));")
+	fmt.Println("-------")
 	L.DoString("print(GetNum1());")
 	L.DoString("Set(100);")
 	L.DoString("print(GetNum1());")

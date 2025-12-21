@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -25,7 +26,6 @@ type ServiceFuncs struct {
 }
 
 func NewState(opts ...Option) *Luax {
-
 	once.Do(func() {
 		opt := lua.Options{}
 		for _, o := range opts {
@@ -50,6 +50,19 @@ func (l *Luax) SetGlobal(v ...any) {
 		}
 	}
 }
+
+func (l *Luax) SetFunction(v ...any) {
+	for _, v := range v {
+		var i = getIns()
+		make_fun(&i, v)
+		pc := reflect.ValueOf(v).Pointer()
+		funcName := runtime.FuncForPC(pc).Name()
+		funcName = strings.Split(funcName, ".")[1]
+		fmt.Println("funcName:", funcName, i)
+		l.L.SetGlobal(funcName, l.L.NewFunction(i))
+	}
+}
+
 func (l *Luax) Module(v ...any) {
 	for _, v := range v {
 		ms := register_global(v)
@@ -104,6 +117,36 @@ func (l *Luax) DoFile(filename string) error {
 	return l.L.DoFile(filename)
 }
 
+func make_fun(fptr any, f any) {
+	// 检查fptr是否是指针类型
+	fn := reflect.ValueOf(fptr)
+	k := fn.Kind()
+	if k == reflect.Pointer {
+		fn = fn.Elem()
+	}
+	res := reflect.MakeFunc(fn.Type(), func(args []reflect.Value) []reflect.Value {
+		L := args[0].Interface().(*lua.LState)
+		vn := reflect.ValueOf(f)
+		tn := reflect.TypeOf(f)
+		params := []reflect.Value{}
+		for i := 0; i < tn.NumIn(); i++ {
+			n := tn.In(i)
+			isPtr := n.Kind() == reflect.Pointer
+			if isPtr {
+				n = n.Elem()
+			}
+			// lua index start from 1
+			params = append(params, getParam(L, n.Kind(), i+1))
+		}
+		rst := vn.Call(params)
+		for _, v := range rst {
+			L.Push(getResult(v))
+		}
+		return []reflect.Value{reflect.ValueOf(len(rst))}
+	})
+	fn.Set(res)
+}
+
 func makeSum(fptr any, m reflect.Method, v reflect.Value) {
 	// 检查fptr是否是指针类型
 	fn := reflect.ValueOf(fptr)
@@ -130,6 +173,7 @@ func makeSum(fptr any, m reflect.Method, v reflect.Value) {
 	})
 	fn.Set(res)
 }
+
 func getResult(v reflect.Value) lua.LValue {
 	switch v.Kind() {
 	case reflect.Int:
