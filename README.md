@@ -1,89 +1,202 @@
+# gua
 
-gua = go+lua
-通过反射实现go函数和lua函数的转化，与当前Golang调用方式保持一致，可通过lua调用go函数,直接返回go函数的返回值，同时改变运行时的上下文环境
+[![Go Report Card](https://goreportcard.com/badge/github.com/w6xian/gua)](https://goreportcard.com/report/github.com/w6xian/gua)
 
-### 示例
-* 实现全局VM
+## 项目简介
+
+`gua` 是一个 Go 语言与 Lua 脚本交互的桥接库，通过反射机制实现 Go 函数和 Lua 函数的相互调用。它保持与当前 Golang 调用方式一致，允许在 Lua 中调用 Go 函数并直接返回 Go 函数的返回值，同时支持改变运行时的上下文环境。
+
+## 特性
+
+- 支持 Go 与 Lua 之间的无缝函数调用
+- 支持全局函数注册与调用
+- 支持全局模块注册与 require 调用
+- 支持通过实例注册全局状态
+- 支持运行时上下文环境的修改
+
+## 安装
+
+```bash
+go get github.com/w6xian/gua
 ```
-L := gua.NewState(gua.CallStackSize(1024))
-```
-#### 支持三种转化方式
-* 全局函数
-```
-func GetNum(a int) int {
-	fmt.Println("GetNum:", a)
-	return 1000 + a
-}
-L.SetFunction(GetNum)// 支持数组
-// 调用lua函数GetNum
-L.DoString("print(GetNum(100));")
-```
-* 全局模块
-通过实例注册全局模块，可在lua中通过require调用，模块中的函数可直接调用，同时改变运行时的上下文环境
-L.Module(...)
-```
+
+## 快速开始
+
+### 基本使用
+
+```go
 package main
 
 import (
 	"fmt"
-
 	"github.com/w6xian/gua"
-	"github.com/w6xian/gua/examples/tm"
 )
 
-type Call struct {
-	Num1 int
-	Num2 int
-}
-
-func (c *Call) GetSub(a int) string {
-	return fmt.Sprintf("%d-%d-%d-leo", c.Num1, c.Num2, a)
-}
-
-func (c *Call) GetMax() int {
-	return max(c.Num1, c.Num2)
-}
-func (c *Call) Get(a, b int) (int, int) {
-	return max(a, b), min(a, b)
-}
-func (c *Call) Set(a int) {
-	c.Num1 = a
-}
-func (c *Call) GetNum1() int {
-	return c.Num1
-}
-
+// 定义一个Go函数
 func GetNum(a int) int {
 	fmt.Println("GetNum:", a)
 	return 1000 + a
 }
 
 func main() {
-
-	call := &Call{Num1: 10, Num2: 20}
-	callx := &tm.Callx{Num2: 1001}
-	t := &tm.Test{Num3: 305}
-	// lua run time VM
+	// 创建Lua状态机
 	L := gua.NewState(gua.CallStackSize(1024))
 	defer L.Close()
-	// global faction
-	L.SetGlobal(call, callx)
-	// global module "require"
-	L.Module(t)
-	// global function
+	
+	// 注册全局函数
 	L.SetFunction(GetNum)
+	
+	// 在Lua中调用Go函数
+	L.DoString("print(GetNum(100));") // 输出: 1100
+}
+```
 
-	fmt.Println("-------")
-	L.DoString("print(GetNum(100));")
-	fmt.Println("-------")
-	L.DoString("print(GetNum1());")
-	L.DoString("Set(100);")
-	L.DoString("print(GetNum1());")
-	L.DoString("print(GetNum2());")
-	L.DoFile("t.lua")
-	// 被改变的上下文环境
-	fmt.Println("main.go", t.GetNum3())
+## 高级用法
+
+### 1. 全局函数
+
+```go
+func GetNum(a int) int {
+	fmt.Println("GetNum:", a)
+	return 1000 + a
 }
 
-
+L.SetFunction(GetNum) // 注册全局函数
+L.DoString("print(GetNum(100));") // 调用Lua函数GetNum
 ```
+
+### 2. 全局状态
+
+```go
+type Call struct {
+	Num1 int
+	Num2 int
+}
+
+func (c *Call) GetSub(a int) string {
+	return fmt.Sprintf("%d-%d-%d", c.Num1, c.Num2, a)
+}
+
+func (c *Call) Set(a int) {
+	c.Num1 = a
+}
+
+func (c *Call) GetNum1() int {
+	return c.Num1
+}
+
+// 注册全局状态
+call := &Call{Num1: 10, Num2: 20}
+L.SetGlobal(call)
+
+// 在Lua中调用
+L.DoString("print(GetNum1());") // 输出: 10
+L.DoString("Set(100);")
+L.DoString("print(GetNum1());") // 输出: 100
+```
+
+### 3. 全局模块
+
+通过实例注册全局模块，可在lua中通过require调用，模块中的函数可直接调用，同时改变运行时的上下文环境。
+
+```go
+type Test struct {
+	Num3 int
+}
+
+func (t *Test) GetNum3() int {
+	return t.Num3
+}
+
+func (t *Test) SetNum3(a int) {
+	t.Num3 = a
+}
+
+// 注册全局模块
+t := &Test{Num3: 305}
+L.Module(t)
+
+// 在Lua中通过require调用
+L.DoString("local test = require('Test')")
+L.DoString("print(test.GetNum3());") // 输出: 305
+L.DoString("test.SetNum3(400);")
+L.DoString("print(test.GetNum3());") // 输出: 400
+```
+
+### 4. 执行Lua文件
+
+```go
+// 执行Lua文件
+L.DoFile("script.lua")
+```
+
+## API 文档
+
+### 核心方法
+
+#### NewState
+创建一个新的Lua状态机
+
+```go
+func NewState(options ...Option) *State
+```
+
+#### SetFunction
+注册全局函数
+
+```go
+func (l *State) SetFunction(fns ...interface{})
+```
+
+#### SetGlobal
+注册全局状态
+
+```go
+func (l *State) SetGlobal(objs ...interface{})
+```
+
+#### Module
+注册全局模块
+
+```go
+func (l *State) Module(objs ...interface{})
+```
+
+#### DoString
+执行Lua字符串
+
+```go
+func (l *State) DoString(str string)
+```
+
+#### DoFile
+执行Lua文件
+
+```go
+func (l *State) DoFile(file string)
+```
+
+#### Close
+关闭Lua状态机
+
+```go
+func (l *State) Close()
+```
+
+## 示例
+
+完整的示例代码请查看 [examples](examples/) 目录。
+
+## 测试
+
+```bash
+go test ./...
+```
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request 来帮助改进这个项目！
+
+## 许可证
+
+MIT License
