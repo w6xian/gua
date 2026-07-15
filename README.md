@@ -13,6 +13,8 @@
 - 支持全局模块注册与 require 调用
 - 支持通过实例注册全局状态
 - 支持运行时上下文环境的修改
+- 支持加载 Lua 模块文件（LoadFile）
+- 支持从 Go 调用 Lua 模块函数（Call/Call2/CallN）
 
 ## 安装
 
@@ -130,6 +132,52 @@ L.DoString("print(test.GetNum3());") // 输出: 400
 L.DoFile("script.lua")
 ```
 
+### 5. 加载 Lua 模块并调用函数
+
+Lua 模块文件需要 `return` 一个表（模块表），Go 侧通过 `LoadFile` 注册模块，然后用 `Call/Call2/CallN` 调用其中的函数。
+
+`m.lua` 示例：
+
+```lua
+local m = {}
+
+function m.Test(a, b, c)
+  return a + b + c, 1
+end
+
+return m
+```
+
+Go 调用示例：
+
+```go
+L := gua.NewState(gua.CallStackSize(1024))
+defer L.Close()
+
+_, err := L.LoadFile("m.lua")
+if err != nil {
+    panic(err)
+}
+
+ret, err := L.Call("m.Test", "100", "200", "300")
+if err != nil {
+    panic(err)
+}
+fmt.Println(ret)
+
+ret1, ret2, err := L.Call2("m.Test", "100", "200", "300")
+if err != nil {
+    panic(err)
+}
+fmt.Println(ret1, ret2)
+
+rets, err := L.CallN("m.Test", 2, "100", "200", "300")
+if err != nil {
+    panic(err)
+}
+fmt.Println(rets)
+```
+
 ## API 文档
 
 ### 核心方法
@@ -138,49 +186,77 @@ L.DoFile("script.lua")
 创建一个新的Lua状态机
 
 ```go
-func NewState(options ...Option) *State
+func NewState(options ...Option) *Luax
 ```
 
 #### SetFunction
 注册全局函数
 
 ```go
-func (l *State) SetFunction(fns ...interface{})
+func (l *Luax) SetFunction(fns ...interface{})
 ```
 
 #### SetGlobal
 注册全局状态
 
 ```go
-func (l *State) SetGlobal(objs ...interface{})
+func (l *Luax) SetGlobal(objs ...interface{})
 ```
 
 #### Module
 注册全局模块
 
 ```go
-func (l *State) Module(objs ...interface{})
+func (l *Luax) Module(objs ...interface{})
 ```
 
 #### DoString
 执行Lua字符串
 
 ```go
-func (l *State) DoString(str string)
+func (l *Luax) DoString(str string) error
 ```
 
 #### DoFile
 执行Lua文件
 
 ```go
-func (l *State) DoFile(file string)
+func (l *Luax) DoFile(file string) error
+```
+
+#### LoadFile
+加载 Lua 模块文件（要求文件内 `return` 模块表），并以文件名（去掉 `.lua` 后缀）作为模块名注册到运行时。
+
+```go
+func (l *Luax) LoadFile(filename string) (*lua.LFunction, error)
+```
+
+#### Call
+调用 Lua 模块函数，函数名格式为 `"模块名.函数名"`，默认返回 1 个值（以字符串形式返回）。
+
+```go
+func (l *Luax) Call(mn string, args ...string) (string, error)
+```
+
+#### Call2
+调用 Lua 模块函数并返回 2 个值（以字符串形式返回）。
+
+```go
+func (l *Luax) Call2(mn string, args ...string) (string, string, error)
+```
+
+#### CallN
+调用 Lua 模块函数并返回 N 个值（以字符串切片形式返回）。
+
+```go
+func (l *Luax) CallN(mn string, nret int, args ...string) ([]string, error)
 ```
 
 #### Close
 关闭Lua状态机
 
 ```go
-func (l *State) Close()
+func (l *Luax) Close()
 ```
 
 ## 示例
