@@ -27,7 +27,8 @@ var once sync.Once
 // 包含了lua.LState实例，提供了更便捷的方法来操作Lua
 
 type Luax struct {
-	L *lua.LState // Lua状态实例
+	L  *lua.LState               // Lua状态实例
+	Fn map[string]*lua.LFunction // 存储注册的Go函数到Lua函数的映射
 }
 
 // ServiceFuncs 服务函数结构体
@@ -55,6 +56,7 @@ func NewState(opts ...Option) *Luax {
 			o(&opt)
 		}
 		_luax = &Luax{L: lua.NewState(opt)}
+		_luax.Fn = make(map[string]*lua.LFunction)
 	})
 	return _luax
 }
@@ -212,6 +214,92 @@ func (l *Luax) DoString(code string) error {
 //	error - 执行过程中的错误
 func (l *Luax) DoFile(filename string) error {
 	return l.L.DoFile(filename)
+}
+
+func (l *Luax) LoadFile(filename string) (*lua.LFunction, error) {
+	fn, err := l.L.LoadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	filename = strings.TrimSuffix(filename, ".lua")
+	l.Fn[filename] = fn
+	return fn, nil
+}
+
+func (l *Luax) Call(mn string, args ...string) (string, error) {
+	res, err := l.CallN(mn, 1, args...)
+	if err != nil {
+		return "", err
+	}
+	return res[0], nil
+}
+func (l *Luax) Call2(mn string, args ...string) (string, string, error) {
+	res, err := l.CallN(mn, 2, args...)
+	if err != nil {
+		return "", "", err
+	}
+	return res[0], res[1], nil
+}
+
+// Call 调用Lua函数
+// 参数：
+//
+//	mn string - Lua函数名，格式为"模块名.函数名"
+//	nret int - 返回值数量
+//	args ...string - 可变参数，要传递给Lua函数的参数
+//
+// 返回值：
+//
+//	string - Lua函数返回的字符串
+//	error - 调用过程中的错误
+func (l *Luax) CallN(mn string, nret int, args ...string) ([]string, error) {
+	// m: module name
+	ns := strings.Split(mn, ".")
+	modname := ns[0]
+	method := ns[1]
+
+	fn, ok := l.Fn[modname]
+	if !ok {
+		fmt.Println("module not found:", modname)
+		return nil, nil
+	}
+	l.L.Push(fn)
+	l.L.Call(0, 1)
+	mod := l.L.Get(-1)
+	l.L.Pop(1)
+	modTable, ok := mod.(*lua.LTable)
+	if !ok {
+		fmt.Println(modname + ".lua did not return a module table")
+		return nil, nil
+	}
+
+	testFn := l.L.GetField(modTable, method)
+	if testFn.Type() != lua.LTFunction {
+		fmt.Println(modname + "." + method + " is not a function")
+		return nil, nil
+	}
+	// 转换参数为Lua值
+	params := []lua.LValue{}
+	for _, arg := range args {
+		params = append(params, lua.LString(arg))
+	}
+
+	if err := l.L.CallByParam(lua.P{
+		Fn:      testFn,
+		NRet:    nret,
+		Protect: true,
+	}, params...); err != nil {
+		fmt.Println("call ", modname+"."+method+" error:", err)
+		return nil, err
+	}
+
+	// 读N个返回值
+	rst := []string{}
+	for i := 1; i <= nret; i++ {
+		rst = append(rst, l.L.Get(-nret+i-1).String())
+	}
+	l.L.Pop(nret)
+	return rst, nil
 }
 
 // make_fun 将Go函数绑定到Lua函数

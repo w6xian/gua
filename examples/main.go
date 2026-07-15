@@ -58,4 +58,43 @@ func main() {
 	L.DoString("print(GetNum2());")
 	L.DoFile("t.lua")
 	fmt.Println("main.go", t.GetNum3())
+	// load module m.lua
+	L.LoadFile("m.lua")
+	_, err := L.LoadFile("n.lua")
+	if err != nil {
+		fmt.Println("LoadFile error:", err)
+		return
+	}
+
+	ret, err := L.Call("m.Test", "100", "200", "300")
+	if err != nil {
+		fmt.Println("Call error:", err)
+		return
+	}
+	fmt.Println(ret)
+	ret1, ret2, err := L.Call2("m.Test", "100", "200", "300")
+	if err != nil {
+		fmt.Println("Call error:", err)
+		return
+	}
+	fmt.Println(ret1, ret2)
+	rets, err := L.CallN("m.Test", 2, "100", "200", "300")
+	if err != nil {
+		fmt.Println("Call error:", err)
+		return
+	}
+	fmt.Println(rets)
+	ret, err = L.Call("m.Test2", "100", "200")
+	if err != nil {
+		fmt.Println("Call error:", err)
+		return
+	}
+	fmt.Println(ret)
+	ret, err = L.Call("n.Max", "100", "200")
+	if err != nil {
+		fmt.Println("Call error:", err)
+		return
+	}
+	fmt.Println(ret)
+
 }
