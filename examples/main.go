@@ -59,7 +59,7 @@ func main() {
 	L.DoFile("t.lua")
 	fmt.Println("main.go", t.GetNum3())
 	// load module m.lua
-	L.LoadFile("m.lua")
+	L.LoadDir("modal")
 	_, err := L.LoadFile("n.lua")
 	if err != nil {
 		fmt.Println("LoadFile error:", err)

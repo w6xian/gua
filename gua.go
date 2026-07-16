@@ -5,6 +5,8 @@ package gua
 import (
 	"fmt"
 	"log"
+	"os"
+	"path"
 	"reflect"
 	"runtime"
 	"strings"
@@ -222,8 +224,26 @@ func (l *Luax) LoadFile(filename string) (*lua.LFunction, error) {
 		return nil, err
 	}
 	filename = strings.TrimSuffix(filename, ".lua")
+	filename = path.Base(filename)
 	l.Fn[filename] = fn
 	return fn, nil
+}
+
+func (l *Luax) LoadDir(path string) error {
+	files, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		filename := path + "/" + file.Name()
+		if _, err := l.LoadFile(filename); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (l *Luax) LoadString(m string, code string) (*lua.LFunction, error) {
