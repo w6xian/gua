@@ -226,6 +226,15 @@ func (l *Luax) LoadFile(filename string) (*lua.LFunction, error) {
 	return fn, nil
 }
 
+func (l *Luax) LoadString(m string, code string) (*lua.LFunction, error) {
+	fn, err := l.L.LoadString(code)
+	if err != nil {
+		return nil, err
+	}
+	l.Fn[m] = fn
+	return fn, nil
+}
+
 func (l *Luax) Call(mn string, args ...string) (string, error) {
 	res, err := l.CallN(mn, 1, args...)
 	if err != nil {

@@ -65,6 +65,11 @@ func main() {
 		fmt.Println("LoadFile error:", err)
 		return
 	}
+	_, loadErr := L.LoadString("c", "return {Test = function(a, b, c) return a, b, c end, Test2 = function(a, b) return a, b end}")
+	if loadErr != nil {
+		fmt.Println("LoadString error:", loadErr)
+		return
+	}
 
 	ret, err := L.Call("m.Test", "100", "200", "300")
 	if err != nil {
@@ -96,5 +101,11 @@ func main() {
 		return
 	}
 	fmt.Println(ret)
+	ret3, err := L.CallN("c.Test", 3, "100", "200", "300")
+	if err != nil {
+		fmt.Println("Call error:", err)
+		return
+	}
+	fmt.Println(ret3)
 
 }
