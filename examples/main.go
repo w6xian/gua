@@ -45,6 +45,7 @@ func main() {
 	// lua run time VM
 	L := gua.NewState(gua.CallStackSize(1024))
 	defer L.Close()
+	L.LogMode(gua.LogModeDebug)
 	// global faction
 	L.SetGlobal(call, callx)
 	// global module "require"
@@ -64,11 +65,20 @@ func main() {
 	L.DoString("Set(100);")
 	L.DoString("print(GetNum1());")
 	L.DoString("print(GetNum2());")
-	L.DoFile("t.lua")
+	if err := L.DoFile("t.lua"); err != nil {
+		fmt.Println("DoFile error:", err)
+		return
+	}
 	fmt.Println("main.go", t.GetNum3())
 	// load module m.lua
-	L.LoadDir("modal")
+	if err := L.LoadDir("modals"); err != nil {
+		fmt.Println("LoadDir error:", err)
+		return
+	}
+	// L.LoadAndWatchDir("modal")
+	// err := L.LoadAndWatchFile("n.lua")
 	_, err := L.LoadFile("n.lua")
+
 	if err != nil {
 		fmt.Println("LoadFile error:", err)
 		return

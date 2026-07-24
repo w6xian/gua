@@ -15,6 +15,7 @@
 - 支持运行时上下文环境的修改
 - 支持加载 Lua 模块文件（LoadFile）
 - 支持从 Go 调用 Lua 模块函数（Call/Call2/CallN）
+- 支持监听 Lua 文件变化并自动重载（WatchFile/WatchDir）
 
 ## 安装
 
@@ -189,6 +190,38 @@ if err != nil {
 fmt.Println(rets)
 ```
 
+### 6. 监听 Lua 文件变化并自动重载
+
+如果希望修改 `.lua` 文件后自动刷新缓存，可以使用 `WatchFile` 或 `WatchDir`。监听到文件创建、写入、重命名后，`gua` 会自动重新执行 `LoadFile`，后续 `Call` 会使用最新版本的 Lua 模块。
+
+```go
+L := gua.NewState(gua.CallStackSize(1024))
+defer L.Close()
+
+if err := L.WatchFile("m.lua"); err != nil {
+    panic(err)
+}
+
+ret, err := L.Call("m.Test", "100", "200", "300")
+if err != nil {
+    panic(err)
+}
+fmt.Println(ret)
+```
+
+也可以监听整个目录：
+
+```go
+if err := L.WatchDir("modal"); err != nil {
+    panic(err)
+}
+```
+
+注意：
+- 仅监听 `.lua` 文件
+- 自动重载会更新 `LoadFile/LoadDir` 注册到内存中的模块缓存
+- 关闭 `Luax` 时会自动停止监听
+
 ## API 文档
 
 ### 核心方法
@@ -247,6 +280,20 @@ func (l *Luax) DoFile(file string) error
 
 ```go
 func (l *Luax) LoadFile(filename string) (*lua.LFunction, error)
+```
+
+#### WatchFile
+监听单个 Lua 文件，文件变化后自动重新加载。
+
+```go
+func (l *Luax) WatchFile(filename string) error
+```
+
+#### WatchDir
+监听目录下的 Lua 文件，文件变化后自动重新加载。
+
+```go
+func (l *Luax) WatchDir(dir string) error
 ```
 
 #### Call
