@@ -119,8 +119,13 @@ func (l *Luax) SetFunction(v ...any) {
 // 参数：
 //
 //	v ...any - 可变参数，要注册的Go值
-func (l *Luax) Module(v ...any) {
+func (l *Luax) Modules(v ...any) {
 	for _, v := range v {
+		k := reflect.ValueOf(v).Kind()
+		if k == reflect.String {
+			// 只处理string类型,为兼容旧版代码
+			continue
+		}
 		// 注册全局变量，获取ServiceFuncs实例
 		ms := register_global(v)
 		// 转换方法为Lua函数映射
@@ -144,6 +149,22 @@ func (l *Luax) Module(v ...any) {
 		// 预加载模块到Lua环境
 		l.L.PreloadModule(mname, i)
 	}
+}
+
+func (l *Luax) Module(name string, v any) {
+	// 注册全局变量，获取ServiceFuncs实例
+	ms := register_global(v)
+	// 转换方法为Lua函数映射
+	lgfuncs := method_lgfunc(ms)
+	// 创建Lua表并设置函数
+	mod := l.L.SetFuncs(l.L.NewTable(), lgfuncs)
+	// 获取Lua函数实例
+	i := getIns()
+	// 绑定模块到Lua函数
+	make_mod(&i, mod)
+	// 解析包路径，生成模块名称
+	// 预加载模块到Lua环境
+	l.L.PreloadModule(name, i)
 }
 
 // make_mod 创建模块加载函数

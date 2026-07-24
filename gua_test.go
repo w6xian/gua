@@ -101,7 +101,7 @@ func TestModuleFunctionality(t *testing.T) {
 
 	// 创建实例并注册为模块
 	calculator := &Calculator{}
-	L.Module(calculator)
+	L.Modules(calculator)
 
 	// 测试基本功能
 	err := L.DoString("print('TestModuleFunctionality: 测试模块功能')")

@@ -5,6 +5,7 @@ import (
 
 	"github.com/w6xian/gua"
 	"github.com/w6xian/gua/examples/tm"
+	"github.com/w6xian/gua/examples/tt"
 )
 
 type Call struct {
@@ -39,13 +40,20 @@ func main() {
 	call := &Call{Num1: 10, Num2: 20}
 	callx := &tm.Callx{Num2: 1001}
 	t := &tm.Test{Num3: 305}
+	t4 := &tt.Test4{Num4: 405}
+
 	// lua run time VM
 	L := gua.NewState(gua.CallStackSize(1024))
 	defer L.Close()
 	// global faction
 	L.SetGlobal(call, callx)
 	// global module "require"
-	L.Module(t)
+	L.Modules(t)
+	// named module name
+	L.Module("tt", t4)
+	// global function
+	L.SetFunction(GetNum)
+
 	// global function
 	L.SetFunction(GetNum)
 

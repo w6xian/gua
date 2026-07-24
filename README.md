@@ -114,15 +114,26 @@ func (t *Test) SetNum3(a int) {
 	t.Num3 = a
 }
 
-// 注册全局模块
+// 注册全局模块（自动生成模块名）
 t := &Test{Num3: 305}
-L.Module(t)
+L.Modules(t)
 
 // 在Lua中通过require调用
-L.DoString("local test = require('Test')")
+// 模块名由包路径与类型名组合生成，并会在日志中打印 preload module: [xxx]
+// 例如 main 包下的 Test 类型，模块名一般为 "main/test"
+L.DoString("local test = require('main/test')")
 L.DoString("print(test.GetNum3());") // 输出: 305
 L.DoString("test.SetNum3(400);")
 L.DoString("print(test.GetNum3());") // 输出: 400
+```
+
+也可以显式指定模块名，方便 require：
+
+```go
+// 指定模块名为 "tt"
+L.Module("tt", t)
+L.DoString("local test = require('tt')")
+L.DoString("print(test.GetNum3());")
 ```
 
 ### 4. 执行Lua文件
@@ -207,7 +218,14 @@ func (l *Luax) SetGlobal(objs ...interface{})
 注册全局模块
 
 ```go
-func (l *Luax) Module(objs ...interface{})
+func (l *Luax) Modules(objs ...interface{})
+```
+
+#### Module
+注册一个指定名称的全局模块
+
+```go
+func (l *Luax) Module(name string, obj interface{})
 ```
 
 #### DoString
