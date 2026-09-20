@@ -36,6 +36,7 @@
 
 - 不要在注册给 Lua 的 Go 函数内部回调同一个 `Luax`（内部锁不可重入，会死锁），需要回调 Lua 时请使用入参里的 `*lua.LState`
 - 直接读写导出字段 `L` 不会加锁，需由调用方保证串行
+- 用 Option 指定 `RegistrySize` 时请同时指定 `RegistryMaxSize`：gopher-lua 在传入 Options 时默认 `RegistryMaxSize=0`（即禁止 registry 自动增长），高并发或深调用可能触发 `registry overflow`
 
 ## 安装
 
@@ -385,6 +386,65 @@ for i := 0; i < 8; i++ {
 wg.Wait()
 ```
 
+## 性能基准
+
+环境：Windows / Intel i5-9400F / Go 1.24 / `go test -cpu=1 -count=3 -benchtime=2s`，取 3 轮最小值。
+旧版 = `git HEAD` 的 `gua.go`，新版 = 当前实现，同一份 `bench_test.go` 在两版目录下各跑一次。
+
+| 基准 | 旧版 ns/op | 新版 ns/op | 变化 |
+| --- | --- | --- | --- |
+| `DoString("x = 1 + 2")` | 8,544 | 8,587 | +0.5% |
+| DoString 调用 Go 方法 | 10,198 | 10,512 | +3.1% |
+| DoString 调用 Go 函数 | 不可用（旧版注册名错误） | 10,909 | — |
+| DoString + require 调用 Go 模块 | 16,729 | 13,450 | **-19.6%（1.24x）** |
+| `Call`（1 个返回值） | 2,289 | 2,384 | +4.2% |
+| `CallN`（2 个返回值） | 2,583 | 2,806 | +8.6% |
+| `DoFile` | 123,738 | 120,836 | -2.3% |
+| `LoadFile` | 96,289 | 114,196 | +18.6% |
+| 裸 `DoString`（绕过封装，噪声对照） | 11,211 | 9,484 | -15.4% |
+| 裸 `LoadFile`（绕过封装，噪声对照） | 102,102 | 112,901 | +10.6% |
+
+结论：加锁、recover、关闭检查这些稳定性加固**没有可测量的性能损失**——
+两版差异都落在噪声区间内（裸调用对照组显示本机噪声下限约 ±10~20%），`require` 模块调用反而快约 20%。
+
+新增类型转换能力（新版独有，无旧版基线，`-count=3 -cpu=1` 最小值）：
+
+| 转换 | ns/op | B/op | allocs/op |
+| --- | --- | --- | --- |
+| 标量 int | 21 | 8 | 1 |
+| struct → table | 1,123 | 3,392 | 16 |
+| map（5 个键）→ table | 2,347 | 4,024 | 43 |
+| `[]int`（100 元素）→ table | 4,203 | 7,248 | 107 |
+| table → struct | 245 | 48 | 3 |
+| Lua 调用返回 struct 的 Go 方法（端到端） | 13,023 | 35,944 | 80 |
+| Lua 传 table 给 Go 方法（端到端） | 16,884 | 34,176 | 117 |
+| Lua 调用返回 100 元素切片的 Go 方法 | 15,128 | 39,800 | 171 |
+
+### 基准测出并修复的缺陷：Lua 栈泄漏
+
+gopher-lua 的 `DoString`/`DoFile` 内部是 `PCall(0, MultRet)`，脚本的返回值会残留在 Lua 栈上。
+旧版反复调用会不断抬高栈顶，最终触发 `registry overflow`：
+
+```
+旧版：第 1022 次 DoString("return 42") → registry overflow
+新版：2000 次后栈顶仍为 0（runScript 在执行后恢复栈高度）
+```
+
+### 复现方式
+
+```bash
+# 当前实现
+go test -run=^$ -bench='Benchmark(DoString|DoFile|Call|Load)' -benchmem -count=3 -cpu=1 .
+go test -run=^$ -bench='Benchmark(Convert|LuaCall)' -benchmem -count=3 -cpu=1 .
+
+# 旧版基线：把 HEAD 版本还原到临时目录，跑同一份 bench_test.go
+mkdir -p /tmp/gua-old
+git show HEAD:gua.go > /tmp/gua-old/gua.go
+git show HEAD:options.go > /tmp/gua-old/options.go
+cp go.mod go.sum bench_test.go leak_test.go /tmp/gua-old/ && cp -r testdata /tmp/gua-old/
+cd /tmp/gua-old && go test -run=^$ -bench='Benchmark(DoString|DoFile|Call|Load)' -benchmem -count=3 -cpu=1 .
+```
+
 ## 示例
 
 完整的示例代码请查看 [examples](examples/) 目录。
@@ -393,6 +453,7 @@ wg.Wait()
 
 ```bash
 go test ./...
+go test -race ./...   # 并发安全
 ```
 
 ## 贡献
