@@ -2,66 +2,40 @@ package gua
 
 import lua "github.com/yuin/gopher-lua"
 
+// Option 用于配置底层 lua.Options
 type Option func(*lua.Options)
 
+// CallStackSize 设置调用栈大小
 func CallStackSize(size int) Option {
-	return func(opt *lua.Options) {
-		opt.CallStackSize = size
-	}
+	return func(opt *lua.Options) { opt.CallStackSize = size }
 }
 
+// RegistrySize 设置数据栈（registry）初始大小
 func RegistrySize(size int) Option {
-	return func(opt *lua.Options) {
-		opt.RegistrySize = size
-	}
+	return func(opt *lua.Options) { opt.RegistrySize = size }
 }
 
+// RegistryMaxSize 设置 registry 可增长到的最大大小，0 表示不允许增长
 func RegistryMaxSize(size int) Option {
-	return func(opt *lua.Options) {
-		opt.RegistryMaxSize = size
-	}
+	return func(opt *lua.Options) { opt.RegistryMaxSize = size }
 }
 
+// RegistryGrowStep 设置 registry 每次增长的步长
 func RegistryGrowStep(size int) Option {
-	return func(opt *lua.Options) {
-		opt.RegistryGrowStep = size
-	}
+	return func(opt *lua.Options) { opt.RegistryGrowStep = size }
 }
 
+// SkipOpenLibs 是否跳过标准库的加载
 func SkipOpenLibs(skip bool) Option {
-	return func(opt *lua.Options) {
-		opt.SkipOpenLibs = skip
-	}
+	return func(opt *lua.Options) { opt.SkipOpenLibs = skip }
 }
 
-// 	IncludeGoStackTrace bool
+// IncludeGoStackTrace 发生 panic 时是否在 Lua 栈信息中包含 Go 的调用栈
 func IncludeGoStackTrace(include bool) Option {
-	return func(opt *lua.Options) {
-		opt.IncludeGoStackTrace = include
-	}
+	return func(opt *lua.Options) { opt.IncludeGoStackTrace = include }
 }
 
-// 	MinimizeStackMemory bool
+// MinimizeStackMemory 是否自动伸缩调用栈以节省内存（有轻微性能损耗）
 func MinimizeStackMemory(minimize bool) Option {
-	return func(opt *lua.Options) {
-		opt.MinimizeStackMemory = minimize
-	}
+	return func(opt *lua.Options) { opt.MinimizeStackMemory = minimize }
 }
-
-// // Call stack size. This defaults to `lua.CallStackSize`.
-// 	CallStackSize int
-// 	// Data stack size. This defaults to `lua.RegistrySize`.
-// 	RegistrySize int
-// 	// Allow the registry to grow from the registry size specified up to a value of RegistryMaxSize. A value of 0
-// 	// indicates no growth is permitted. The registry will not shrink again after any growth.
-// 	RegistryMaxSize int
-// 	// If growth is enabled, step up by an additional `RegistryGrowStep` each time to avoid having to resize too often.
-// 	// This defaults to `lua.RegistryGrowStep`
-// 	RegistryGrowStep int
-// 	// Controls whether or not libraries are opened by default
-// 	SkipOpenLibs bool
-// 	// Tells whether a Go stacktrace should be included in a Lua stacktrace when panics occur.
-// 	IncludeGoStackTrace bool
-// 	// If `MinimizeStackMemory` is set, the call stack will be automatically grown or shrank up to a limit of
-// 	// `CallStackSize` in order to minimize memory usage. This does incur a slight performance penalty.
-// 	MinimizeStackMemory bool

@@ -1,372 +1,500 @@
-// Package gua 提供了与Lua脚本交互的功能，基于gopher-lua库
-// 主要功能包括：创建Lua状态、注册全局变量和函数、注册模块、执行Lua代码
+// Package gua 提供了与 Lua 脚本交互的能力，基于 gopher-lua 实现。
+//
+// 稳定性约定：
+//   - 所有对外方法都持有内部互斥锁，同一个 Luax 可以被多个 goroutine 并发使用；
+//   - Lua 状态关闭后，所有对外方法返回 ErrClosed（或忽略），不会 panic；
+//   - 注册到 Lua 的 Go 函数/方法内部发生的 panic 会被转换为 Lua 错误，不会拖垮宿主进程；
+//   - Go 与 Lua 之间的值转换支持 bool/整数/浮点/string/slice/map/struct/指针，
+//     不支持的类型返回错误而不是 panic。
+//
+// 使用注意：
+//   - 不要在注册给 Lua 的 Go 函数内部回调同一个 Luax（互斥锁不可重入，会死锁），
+//     需要回调时请直接使用函数入参中的 *lua.LState；
+//   - 直接读写导出字段 L 不会加锁，调用方需自行保证串行。
 package gua
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 	lua "github.com/yuin/gopher-lua"
 )
 
-// _luax 全局Luax实例
-var _luax *Luax
+// ErrClosed 表示 Lua 状态已经关闭，不能再使用
+var ErrClosed = errors.New("lua state is closed")
 
-// once 确保Luax实例只被创建一次
-var once sync.Once
-
-// Option Lua选项函数类型
-// 用于配置lua.Options
-// TODO: 定义Option类型，当前代码中使用了但未定义
-
-// Luax Lua执行环境的封装结构体
-// 包含了lua.LState实例，提供了更便捷的方法来操作Lua
-
-type Luax struct {
-	L *lua.LState // Lua状态实例
-
-	Fn map[string]*lua.LFunction // 存储注册的Go函数到Lua函数的映射
-
-	logMode      LogMode
-	mu           sync.Mutex
-	watcher      *fsnotify.Watcher
-	watchedFiles map[string]string
-	watchedDirs  map[string]struct{}
-	lastReload   map[string]time.Time
-	stopWatch    chan struct{}
-	watchOnce    sync.Once
-}
-
+// reloadDebounce 文件监听的防抖间隔，避免编辑器多次写入导致重复重载
 const reloadDebounce = 200 * time.Millisecond
 
+// LogMode 日志级别
 type LogMode int
 
 const (
+	// LogModeSilent 静默模式（默认）
 	LogModeSilent LogMode = iota
+	// LogModeDebug 调试模式，输出注册与重载等调试日志
 	LogModeDebug
 )
 
-// ServiceFuncs 服务函数结构体
-// 存储服务的名称、接收器和注册的方法
+// Luax Lua 执行环境的封装，是 goroutine 安全的。
+type Luax struct {
+	L  *lua.LState               // Lua 状态实例
+	Fn map[string]*lua.LFunction // 已加载的 Lua 模块（模块名 -> 入口函数）
 
-type ServiceFuncs struct {
-	N string                    // name of service - 服务名称
-	V reflect.Value             // receiver of methods for the service - 服务方法的接收器
-	M map[string]reflect.Method // registered methods - 注册的方法映射
+	logMode atomic.Int32
+
+	mu        sync.Mutex // 保护 L、Fn 以及监听相关的所有状态
+	closed    bool
+	closeOnce sync.Once
+
+	watcher      *fsnotify.Watcher
+	watchedFiles map[string]string    // 文件绝对路径 -> 模块名
+	watchedDirs  map[string]struct{}  // 已监听的目录
+	lastReload   map[string]time.Time // 防抖用的上次重载时间
+	stopWatch    chan struct{}        // 关闭监听循环的信号
 }
 
-// NewState 创建一个新的Luax实例
-// 使用sync.Once确保实例只被创建一次（单例模式）
-// 参数：
-//
-//	opts ...Option - 可选的Lua选项配置函数
-//
-// 返回值：
-//
-//	*Luax - 创建的Luax实例
-func NewState(opts ...Option) *Luax {
-	once.Do(func() {
-		opt := lua.Options{}
-		for _, o := range opts {
+// ServiceFuncs 服务描述：名称、接收器与导出方法
+type ServiceFuncs struct {
+	N string                    // name of service - 服务名称（包路径.类型名）
+	V reflect.Value             // receiver of methods for the service - 方法接收器
+	M map[string]reflect.Method // registered methods - 导出的方法
+}
+
+var (
+	stateMu sync.Mutex
+	_luax   *Luax
+)
+
+// New 创建一个全新的 Luax 实例（非单例）。
+// 需要多个相互隔离的 Lua 环境时使用它。
+func New(opts ...Option) *Luax {
+	opt := lua.Options{}
+	for _, o := range opts {
+		if o != nil {
 			o(&opt)
 		}
-		_luax = &Luax{L: lua.NewState(opt)}
-		_luax.Fn = make(map[string]*lua.LFunction)
-		_luax.watchedFiles = make(map[string]string)
-		_luax.watchedDirs = make(map[string]struct{})
-		_luax.lastReload = make(map[string]time.Time)
-		_luax.stopWatch = make(chan struct{})
-	})
+	}
+	return &Luax{
+		L:            lua.NewState(opt),
+		Fn:           make(map[string]*lua.LFunction),
+		watchedFiles: make(map[string]string),
+		watchedDirs:  make(map[string]struct{}),
+		lastReload:   make(map[string]time.Time),
+		stopWatch:    make(chan struct{}),
+	}
+}
+
+// NewState 返回进程内共享的 Luax 实例（单例）。
+// 首次调用时按 opts 创建；实例被 Close 后再次调用会重新创建，避免拿到已关闭的状态。
+// 并发调用是安全的。
+func NewState(opts ...Option) *Luax {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if _luax == nil || _luax.Closed() {
+		_luax = New(opts...)
+	}
 	return _luax
 }
 
+// LogMode 设置日志级别
 func (l *Luax) LogMode(mode LogMode) {
+	l.logMode.Store(int32(mode))
+}
+
+// Closed 返回 Lua 状态是否已经关闭
+func (l *Luax) Closed() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.logMode = mode
+	return l.closed
 }
 
-func (l *Luax) debugf(format string, args ...any) {
-	if l.logMode == LogModeDebug {
-		log.Printf(format, args...)
-	}
-}
-
-// Close 关闭Lua状态
-// 释放Lua状态占用的资源
+// Close 关闭 Lua 状态并停止文件监听，可重复调用且不会 panic。
 func (l *Luax) Close() {
-	l.closeWatcher()
-	l.L.Close()
-}
-
-// SetGlobal 注册全局变量到Lua环境
-// 将Go结构体的方法注册为Lua全局函数
-// 参数：
-//
-//	v ...any - 可变参数，要注册的Go值
-func (l *Luax) SetGlobal(v ...any) {
-	for _, v := range v {
-		// 注册全局变量，获取ServiceFuncs实例
-		ms := register_global(v)
-		// 遍历所有方法，注册为Lua全局函数
-		for _, m := range ms.M {
-			// 获取Lua函数实例
-			var i = getIns()
-			// 绑定方法到Lua函数
-			makeSum(&i, m, ms.V)
-			// 设置为Lua全局函数
-			l.L.SetGlobal(m.Name, l.L.NewFunction(i))
+	l.closeOnce.Do(func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.closed = true
+		l.stopWatcherLocked()
+		if l.L != nil && !l.L.IsClosed() {
+			l.L.Close()
 		}
-	}
-}
-
-// SetFunction 注册Go函数到Lua环境
-// 将Go函数注册为Lua全局函数
-// 参数：
-//
-//	v ...any - 可变参数，要注册的Go函数
-func (l *Luax) SetFunction(v ...any) {
-	for _, v := range v {
-		// 获取Lua函数实例
-		var i = getIns()
-		// 绑定Go函数到Lua函数
-		make_fun(&i, v)
-		// 获取函数指针，用于获取函数名称
-		pc := reflect.ValueOf(v).Pointer()
-		// 获取函数名称
-		funcName := runtime.FuncForPC(pc).Name()
-		// 提取函数名称（去掉包名部分）
-		funcName = strings.Split(funcName, ".")[1]
-		// 打印函数名称和指针
-		l.debugf("funcName: %s %v", funcName, i)
-		// 设置为Lua全局函数
-		l.L.SetGlobal(funcName, l.L.NewFunction(i))
-	}
-}
-
-// Module 注册Go结构体为Lua模块
-// 将Go结构体的方法注册为Lua模块的函数
-// 参数：
-//
-//	v ...any - 可变参数，要注册的Go值
-func (l *Luax) Modules(v ...any) {
-	for _, v := range v {
-		k := reflect.ValueOf(v).Kind()
-		if k == reflect.String {
-			// 只处理string类型,为兼容旧版代码
-			continue
-		}
-		// 注册全局变量，获取ServiceFuncs实例
-		ms := register_global(v)
-		// 转换方法为Lua函数映射
-		lgfuncs := method_lgfunc(ms)
-		// 创建Lua表并设置函数
-		mod := l.L.SetFuncs(l.L.NewTable(), lgfuncs)
-		// 获取Lua函数实例
-		i := getIns()
-		// 绑定模块到Lua函数
-		make_mod(&i, mod)
-		// 解析包路径，生成模块名称
-		pkPath := strings.Split(ms.N, "/")
-		pkName := pkPath[len(pkPath)-1]
-		names := strings.Split(pkName, ".")
-		names[len(names)-1] = strings.ToLower(names[len(names)-1])
-		pkPath = pkPath[:len(pkPath)-1]
-		pkPath = append(pkPath, names...)
-		mname := strings.Join(pkPath, "/")
-		// 打印预加载模块信息
-		l.debugf("preload module: [%s]", mname)
-		// 预加载模块到Lua环境
-		l.L.PreloadModule(mname, i)
-	}
-}
-
-func (l *Luax) Module(name string, v any) {
-	// 注册全局变量，获取ServiceFuncs实例
-	ms := register_global(v)
-	// 转换方法为Lua函数映射
-	lgfuncs := method_lgfunc(ms)
-	// 创建Lua表并设置函数
-	mod := l.L.SetFuncs(l.L.NewTable(), lgfuncs)
-	// 获取Lua函数实例
-	i := getIns()
-	// 绑定模块到Lua函数
-	make_mod(&i, mod)
-	// 解析包路径，生成模块名称
-	// 预加载模块到Lua环境
-	l.L.PreloadModule(name, i)
-}
-
-// make_mod 创建模块加载函数
-// 将Lua表绑定到一个函数，该函数返回模块表
-// 参数：
-//
-//	fptr any - 函数指针，用于存储创建的函数
-//	mod *lua.LTable - 模块表
-func make_mod(fptr any, mod *lua.LTable) {
-	// 检查fptr是否是指针类型
-	fn := reflect.ValueOf(fptr)
-	k := fn.Kind()
-	if k == reflect.Pointer {
-		fn = fn.Elem()
-	}
-	// 使用反射创建函数，该函数返回模块表
-	res := reflect.MakeFunc(fn.Type(), func(args []reflect.Value) []reflect.Value {
-		// 获取Lua状态
-		L := args[0].Interface().(*lua.LState)
-		// 将模块表压入栈
-		L.Push(mod)
-		// 返回值数量为1
-		return []reflect.Value{reflect.ValueOf(1)}
 	})
-	// 设置函数值
-	fn.Set(res)
 }
 
-// method_lgfunc 将ServiceFuncs的方法转换为Lua函数映射
-// 参数：
-//
-//	ms *ServiceFuncs - ServiceFuncs实例
-//
-// 返回值：
-//
-//	map[string]lua.LGFunction - Lua函数映射
-func method_lgfunc(ms *ServiceFuncs) map[string]lua.LGFunction {
-	lgfuncs := map[string]lua.LGFunction{}
-	// 遍历所有方法，转换为Lua函数
-	for _, m := range ms.M {
-		// 获取Lua函数实例
-		var i = getIns()
-		// 绑定方法到Lua函数
-		makeSum(&i, m, ms.V)
-		// 添加到映射
-		lgfuncs[m.Name] = i
-	}
-	return lgfuncs
+// SetGlobal 把 Go 值（通常是指针）的导出方法注册为 Lua 全局函数。
+// 注册失败的值会被跳过并记录日志，不影响其他值。
+func (l *Luax) SetGlobal(v ...any) {
+	l.report(l.exec("SetGlobal", func() error { return l.setGlobalLocked(v) }))
 }
 
-// DoString 执行Lua代码字符串
-// 参数：
-//
-//	code string - Lua代码字符串
-//
-// 返回值：
-//
-//	error - 执行过程中的错误
-func (l *Luax) DoString(code string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.L.DoString(code)
+// SetFunction 把 Go 函数注册为 Lua 全局函数，函数名由函数签名推导。
+func (l *Luax) SetFunction(v ...any) {
+	l.report(l.exec("SetFunction", func() error { return l.setFunctionLocked(v) }))
 }
 
-// DoFile 执行Lua代码文件
-// 参数：
-//
-//	filename string - Lua代码文件路径
-//
-// 返回值：
-//
-//	error - 执行过程中的错误
-func (l *Luax) DoFile(filename string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.L.DoFile(filename)
+// Modules 把 Go 值的导出方法注册为 Lua 模块，模块名由包路径与类型名推导，
+// 可在 Lua 中通过 require 调用。为兼容旧版本，字符串参数会被忽略。
+func (l *Luax) Modules(v ...any) {
+	l.report(l.exec("Modules", func() error { return l.modulesLocked(v) }))
 }
 
-func (l *Luax) LoadFile(filename string) (*lua.LFunction, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.loadFileLocked(filename)
-}
-
-func (l *Luax) loadFileLocked(filename string) (*lua.LFunction, error) {
-	fn, err := l.L.LoadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	modName := moduleNameFromFilename(filename)
-	l.Fn[modName] = fn
-	return fn, nil
-}
-
-func (l *Luax) LoadDir(path string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.loadDirLocked(path)
-}
-
-func (l *Luax) loadDirLocked(dir string) error {
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	for _, file := range files {
-		if file.IsDir() || filepath.Ext(file.Name()) != ".lua" {
-			continue
+// Module 以指定名称注册 Lua 模块，可在 Lua 中通过 require(name) 调用。
+func (l *Luax) Module(name string, v any) {
+	l.report(l.exec("Module", func() error {
+		if strings.TrimSpace(name) == "" {
+			return errors.New("module name is empty")
 		}
-		filename := filepath.Join(dir, file.Name())
-		if _, err := l.loadFileLocked(filename); err != nil {
+		svc, err := newService(v)
+		if err != nil {
 			return err
 		}
-	}
-	return nil
+		return l.preloadModuleLocked(name, svc)
+	}))
 }
 
+// DoString 执行 Lua 代码字符串
+func (l *Luax) DoString(code string) error {
+	return l.exec("DoString", func() error { return l.runScript(l.L.DoString, code) })
+}
+
+// DoFile 执行 Lua 文件
+func (l *Luax) DoFile(filename string) error {
+	return l.exec("DoFile", func() error { return l.runScript(l.L.DoFile, filename) })
+}
+
+// runScript 执行 DoString/DoFile，并保证执行后 Lua 栈回到执行前的高度。
+// gopher-lua 的 DoString/DoFile 内部使用 PCall(0, MultRet)，脚本的返回值会残留在栈上，
+// 反复调用会不断抬高栈顶，最终触发 registry overflow。
+func (l *Luax) runScript(do func(string) error, src string) error {
+	top := l.L.GetTop()
+	err := do(src)
+	if cur := l.L.GetTop(); cur > top {
+		l.L.Pop(cur - top)
+	}
+	return err
+}
+
+// LoadFile 加载 Lua 模块文件（文件需要 return 一个模块表），
+// 以文件名（去掉 .lua 后缀）作为模块名注册，供 Call/Call2/CallN 使用。
+func (l *Luax) LoadFile(filename string) (fn *lua.LFunction, err error) {
+	err = l.exec("LoadFile", func() error {
+		var e error
+		fn, e = l.loadFileLocked(filename)
+		return e
+	})
+	return fn, err
+}
+
+// LoadDir 加载目录下的所有 .lua 模块文件（不递归子目录）
+func (l *Luax) LoadDir(path string) error {
+	return l.exec("LoadDir", func() error { return l.loadDirLocked(path) })
+}
+
+// LoadString 以模块名 m 注册一段 Lua 代码（代码需要 return 一个模块表）
+func (l *Luax) LoadString(m string, code string) (fn *lua.LFunction, err error) {
+	err = l.exec("LoadString", func() error {
+		var e error
+		fn, e = l.loadStringLocked(m, code)
+		return e
+	})
+	return fn, err
+}
+
+// LoadAndWatchFile 加载 Lua 文件并监听其变化，变化后自动重载
 func (l *Luax) LoadAndWatchFile(filename string) error {
-	_, err := l.LoadFile(filename)
-	if err != nil {
+	if _, err := l.LoadFile(filename); err != nil {
 		return err
 	}
 	return l.WatchFile(filename)
 }
 
+// LoadAndWatchDir 加载目录下的 Lua 文件并监听目录变化，变化后自动重载
 func (l *Luax) LoadAndWatchDir(dir string) error {
-	err := l.LoadDir(dir)
-	if err != nil {
+	if err := l.LoadDir(dir); err != nil {
 		return err
 	}
 	return l.WatchDir(dir)
 }
 
-func (l *Luax) LoadString(m string, code string) (*lua.LFunction, error) {
+// WatchFile 监听单个 .lua 文件，文件变化后自动重载
+func (l *Luax) WatchFile(filename string) error {
+	absFile, err := filepath.Abs(filename)
+	if err != nil {
+		return fmt.Errorf("gua: WatchFile: %w", err)
+	}
+	if strings.ToLower(filepath.Ext(absFile)) != ".lua" {
+		return fmt.Errorf("gua: WatchFile: only .lua files are supported: %s", filename)
+	}
+	return l.exec("WatchFile", func() error { return l.watchFileLocked(absFile) })
+}
+
+// WatchDir 监听目录下的 .lua 文件，文件变化后自动重载
+func (l *Luax) WatchDir(dir string) error {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("gua: WatchDir: %w", err)
+	}
+	return l.exec("WatchDir", func() error { return l.watchDirLocked(absDir) })
+}
+
+// Call 调用 Lua 模块函数并返回 1 个字符串结果
+func (l *Luax) Call(mn string, args ...string) (string, error) {
+	res, err := l.CallN(mn, 1, args...)
+	if err != nil {
+		return "", err
+	}
+	if len(res) < 1 {
+		return "", fmt.Errorf("gua: call %s returned %d values, want at least 1", mn, len(res))
+	}
+	return res[0], nil
+}
+
+// Call2 调用 Lua 模块函数并返回 2 个字符串结果
+func (l *Luax) Call2(mn string, args ...string) (string, string, error) {
+	res, err := l.CallN(mn, 2, args...)
+	if err != nil {
+		return "", "", err
+	}
+	if len(res) < 2 {
+		return "", "", fmt.Errorf("gua: call %s returned %d values, want at least 2", mn, len(res))
+	}
+	return res[0], res[1], nil
+}
+
+// CallN 调用 Lua 模块函数 "模块名.函数名" 并返回 nret 个字符串结果。
+// 模块表每次调用都会重新执行，因此文件监听重载后能立即生效。
+func (l *Luax) CallN(mn string, nret int, args ...string) (ret []string, err error) {
+	if nret < 0 {
+		return nil, fmt.Errorf("gua: CallN: negative nret %d", nret)
+	}
+	err = l.exec("CallN", func() error {
+		var e error
+		ret, e = l.callLocked(mn, nret, args)
+		return e
+	})
+	return ret, err
+}
+
+/* ------------------------------ 内部实现 ------------------------------ */
+
+// exec 是所有对外操作的统一入口：加锁 + 关闭检查 + panic 恢复
+func (l *Luax) exec(name string, fn func() error) (err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.loadStringLocked(m, code)
+	if l.closed || l.L == nil || l.L.IsClosed() {
+		return fmt.Errorf("%w (%s)", ErrClosed, name)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("gua: %s: recovered panic: %v", name, r)
+		}
+	}()
+	if err := fn(); err != nil {
+		return fmt.Errorf("gua: %w", err)
+	}
+	return nil
+}
+
+// report 记录无返回值的注册方法的错误
+func (l *Luax) report(err error) {
+	if err != nil {
+		l.warnf("%v", err)
+	}
+}
+
+func (l *Luax) warnf(format string, args ...any) {
+	log.Printf(format, args...)
+}
+
+func (l *Luax) debugf(format string, args ...any) {
+	if LogMode(l.logMode.Load()) == LogModeDebug {
+		log.Printf("gua: "+format, args...)
+	}
+}
+
+func (l *Luax) setGlobalLocked(vs []any) error {
+	var errs []error
+	for _, v := range vs {
+		svc, err := newService(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("SetGlobal: %w", err))
+			continue
+		}
+		for _, m := range svc.M {
+			fn, err := bindMethod(svc.V, m)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("SetGlobal: %w", err))
+				continue
+			}
+			l.L.SetGlobal(m.Name, l.L.NewFunction(fn))
+			l.debugf("set global function: %s", m.Name)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (l *Luax) setFunctionLocked(vs []any) error {
+	var errs []error
+	for _, v := range vs {
+		rv := reflect.ValueOf(v)
+		name, err := funcName(rv)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("SetFunction: %w", err))
+			continue
+		}
+		fn, err := bindFunc(name, rv)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("SetFunction: %w", err))
+			continue
+		}
+		l.L.SetGlobal(name, l.L.NewFunction(fn))
+		l.debugf("set global function: %s", name)
+	}
+	return errors.Join(errs...)
+}
+
+func (l *Luax) modulesLocked(vs []any) error {
+	var errs []error
+	for _, v := range vs {
+		rv := reflect.ValueOf(v)
+		if rv.IsValid() && rv.Kind() == reflect.String {
+			continue // 兼容旧版代码：字符串参数忽略
+		}
+		svc, err := newService(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("Modules: %w", err))
+			continue
+		}
+		if err := l.preloadModuleLocked(moduleNameFromType(svc.N), svc); err != nil {
+			errs = append(errs, fmt.Errorf("Modules: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (l *Luax) preloadModuleLocked(name string, svc *ServiceFuncs) error {
+	funcs := make(map[string]lua.LGFunction, len(svc.M))
+	var errs []error
+	for _, m := range svc.M {
+		fn, err := bindMethod(svc.V, m)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		funcs[m.Name] = fn
+	}
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("module %s: %w", name, err)
+	}
+	mod := l.L.SetFuncs(l.L.NewTable(), funcs)
+	l.L.PreloadModule(name, moduleLoader(mod))
+	l.debugf("preload module: [%s]", name)
+	return nil
+}
+
+func (l *Luax) loadFileLocked(filename string) (*lua.LFunction, error) {
+	fn, err := l.L.LoadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("load %s: %w", filename, err)
+	}
+	modName := moduleNameFromFilename(filename)
+	l.Fn[modName] = fn
+	l.debugf("loaded lua module: %s (%s)", modName, filename)
+	return fn, nil
+}
+
+func (l *Luax) loadDirLocked(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read dir %s: %w", dir, err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	var errs []error
+	for _, e := range entries {
+		if e.IsDir() || strings.ToLower(filepath.Ext(e.Name())) != ".lua" {
+			continue
+		}
+		if _, err := l.loadFileLocked(filepath.Join(dir, e.Name())); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (l *Luax) loadStringLocked(m string, code string) (*lua.LFunction, error) {
+	if strings.TrimSpace(m) == "" {
+		return nil, errors.New("module name is empty")
+	}
 	fn, err := l.L.LoadString(code)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load module %s: %w", m, err)
 	}
 	l.Fn[m] = fn
 	return fn, nil
 }
 
-func (l *Luax) WatchFile(filename string) error {
-	absFile, err := filepath.Abs(filename)
-	if err != nil {
+func (l *Luax) callLocked(mn string, nret int, args []string) ([]string, error) {
+	ns := strings.Split(mn, ".")
+	if len(ns) != 2 || ns[0] == "" || ns[1] == "" {
+		return nil, fmt.Errorf("invalid lua function name %q, want module.function", mn)
+	}
+	modname, method := ns[0], ns[1]
+
+	fn, ok := l.Fn[modname]
+	if !ok {
+		return nil, fmt.Errorf("module not found: %s", modname)
+	}
+
+	// 执行模块入口，取到模块表（保护调用，Lua 报错不会导致进程崩溃）
+	if err := l.L.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true}); err != nil {
+		return nil, fmt.Errorf("load module %s: %w", modname, err)
+	}
+	mod := l.L.Get(-1)
+	l.L.Pop(1)
+	modTable, ok := mod.(*lua.LTable)
+	if !ok {
+		return nil, fmt.Errorf("%s did not return a module table", modname)
+	}
+
+	target := l.L.GetField(modTable, method)
+	if target.Type() != lua.LTFunction {
+		return nil, fmt.Errorf("%s.%s is not a function", modname, method)
+	}
+
+	params := make([]lua.LValue, 0, len(args))
+	for _, arg := range args {
+		params = append(params, lua.LString(arg))
+	}
+	if err := l.L.CallByParam(lua.P{Fn: target, NRet: nret, Protect: true}, params...); err != nil {
+		return nil, fmt.Errorf("call %s.%s: %w", modname, method, err)
+	}
+
+	rst := make([]string, 0, nret)
+	for i := 1; i <= nret; i++ {
+		rst = append(rst, l.L.Get(-nret+i-1).String())
+	}
+	l.L.Pop(nret)
+	return rst, nil
+}
+
+/* ------------------------------ 文件监听 ------------------------------ */
+
+func (l *Luax) watchFileLocked(absFile string) error {
+	if err := l.ensureWatcherLocked(); err != nil {
 		return err
 	}
-	if filepath.Ext(absFile) != ".lua" {
-		return fmt.Errorf("watch file only supports .lua files: %s", filename)
-	}
-
-	if err := l.ensureWatcher(); err != nil {
-		return err
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if _, err := l.loadFileLocked(absFile); err != nil {
 		return err
 	}
@@ -377,34 +505,26 @@ func (l *Luax) WatchFile(filename string) error {
 		return nil
 	}
 	if err := l.watcher.Add(dir); err != nil {
-		return err
+		return fmt.Errorf("watch %s: %w", dir, err)
 	}
 	l.watchedDirs[dir] = struct{}{}
 	return nil
 }
 
-func (l *Luax) WatchDir(dir string) error {
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
+func (l *Luax) watchDirLocked(absDir string) error {
+	if err := l.ensureWatcherLocked(); err != nil {
 		return err
 	}
-	if err := l.ensureWatcher(); err != nil {
-		return err
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if err := l.loadDirLocked(absDir); err != nil {
 		return err
 	}
 
 	files, err := os.ReadDir(absDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("read dir %s: %w", absDir, err)
 	}
 	for _, file := range files {
-		if file.IsDir() || filepath.Ext(file.Name()) != ".lua" {
+		if file.IsDir() || strings.ToLower(filepath.Ext(file.Name())) != ".lua" {
 			continue
 		}
 		fullPath := filepath.Join(absDir, file.Name())
@@ -415,39 +535,39 @@ func (l *Luax) WatchDir(dir string) error {
 		return nil
 	}
 	if err := l.watcher.Add(absDir); err != nil {
-		return err
+		return fmt.Errorf("watch %s: %w", absDir, err)
 	}
 	l.watchedDirs[absDir] = struct{}{}
 	return nil
 }
 
-func (l *Luax) ensureWatcher() error {
-	var err error
-	l.watchOnce.Do(func() {
-		var watcher *fsnotify.Watcher
-		watcher, err = fsnotify.NewWatcher()
-		if err != nil {
-			return
-		}
-		l.watcher = watcher
-		go l.watchLoop()
-	})
-	return err
+// ensureWatcherLocked 创建监听实例，创建失败不会留下半初始化状态
+func (l *Luax) ensureWatcherLocked() error {
+	if l.watcher != nil {
+		return nil
+	}
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("create file watcher: %w", err)
+	}
+	l.watcher = w
+	go l.watchLoop(w)
+	return nil
 }
 
-func (l *Luax) watchLoop() {
+func (l *Luax) watchLoop(w *fsnotify.Watcher) {
 	for {
 		select {
-		case event, ok := <-l.watcher.Events:
+		case event, ok := <-w.Events:
 			if !ok {
 				return
 			}
 			l.handleWatchEvent(event)
-		case err, ok := <-l.watcher.Errors:
+		case err, ok := <-w.Errors:
 			if !ok {
 				return
 			}
-			log.Printf("lua watcher error: %v", err)
+			l.warnf("gua: watcher error: %v", err)
 		case <-l.stopWatch:
 			return
 		}
@@ -455,7 +575,7 @@ func (l *Luax) watchLoop() {
 }
 
 func (l *Luax) handleWatchEvent(event fsnotify.Event) {
-	if filepath.Ext(event.Name) != ".lua" {
+	if strings.ToLower(filepath.Ext(event.Name)) != ".lua" {
 		return
 	}
 	if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
@@ -464,18 +584,21 @@ func (l *Luax) handleWatchEvent(event fsnotify.Event) {
 
 	fullPath, err := filepath.Abs(event.Name)
 	if err != nil {
-		log.Printf("lua watcher path error: %v", err)
+		l.warnf("gua: watcher path error: %v", err)
 		return
 	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.closed {
+		return
+	}
+
 	dir := filepath.Dir(fullPath)
 	if _, watchingDir := l.watchedDirs[dir]; watchingDir {
 		l.watchedFiles[fullPath] = moduleNameFromFilename(fullPath)
 	}
-
 	if _, ok := l.watchedFiles[fullPath]; !ok {
 		return
 	}
@@ -484,321 +607,31 @@ func (l *Luax) handleWatchEvent(event fsnotify.Event) {
 	if last, ok := l.lastReload[fullPath]; ok && now.Sub(last) < reloadDebounce {
 		return
 	}
-
 	if _, err := l.loadFileLocked(fullPath); err != nil {
-		log.Printf("reload lua file %s error: %v", fullPath, err)
+		l.warnf("gua: reload %s error: %v", fullPath, err)
 		return
 	}
 	l.lastReload[fullPath] = now
 	l.debugf("reloaded lua file: %s", fullPath)
 }
 
-func (l *Luax) closeWatcher() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+// stopWatcherLocked 停止监听循环并释放资源
+func (l *Luax) stopWatcherLocked() {
 	select {
 	case <-l.stopWatch:
 	default:
 		close(l.stopWatch)
 	}
-
 	if l.watcher != nil {
 		_ = l.watcher.Close()
 		l.watcher = nil
 	}
+	l.watchedFiles = make(map[string]string)
+	l.watchedDirs = make(map[string]struct{})
+	l.lastReload = make(map[string]time.Time)
 }
 
-func (l *Luax) Call(mn string, args ...string) (string, error) {
-	res, err := l.CallN(mn, 1, args...)
-	if err != nil {
-		return "", err
-	}
-	if len(res) < 1 {
-		return "", fmt.Errorf("call %s returned %d values, want at least 1", mn, len(res))
-	}
-	return res[0], nil
-}
-func (l *Luax) Call2(mn string, args ...string) (string, string, error) {
-	res, err := l.CallN(mn, 2, args...)
-	if err != nil {
-		return "", "", err
-	}
-	if len(res) < 2 {
-		return "", "", fmt.Errorf("call %s returned %d values, want at least 2", mn, len(res))
-	}
-	return res[0], res[1], nil
-}
-
-// Call 调用Lua函数
-// 参数：
-//
-//	mn string - Lua函数名，格式为"模块名.函数名"
-//	nret int - 返回值数量
-//	args ...string - 可变参数，要传递给Lua函数的参数
-//
-// 返回值：
-//
-//	string - Lua函数返回的字符串
-//	error - 调用过程中的错误
-func (l *Luax) CallN(mn string, nret int, args ...string) ([]string, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// m: module name
-	ns := strings.Split(mn, ".")
-	if len(ns) != 2 {
-		return nil, fmt.Errorf("invalid lua function name %q, want module.function", mn)
-	}
-	modname := ns[0]
-	method := ns[1]
-
-	fn, ok := l.Fn[modname]
-	if !ok {
-		return nil, fmt.Errorf("module not found: %s", modname)
-	}
-	l.L.Push(fn)
-	l.L.Call(0, 1)
-	mod := l.L.Get(-1)
-	l.L.Pop(1)
-	modTable, ok := mod.(*lua.LTable)
-	if !ok {
-		return nil, fmt.Errorf("%s.lua did not return a module table", modname)
-	}
-
-	testFn := l.L.GetField(modTable, method)
-	if testFn.Type() != lua.LTFunction {
-		return nil, fmt.Errorf("%s.%s is not a function", modname, method)
-	}
-	// 转换参数为Lua值
-	params := []lua.LValue{}
-	for _, arg := range args {
-		params = append(params, lua.LString(arg))
-	}
-
-	if err := l.L.CallByParam(lua.P{
-		Fn:      testFn,
-		NRet:    nret,
-		Protect: true,
-	}, params...); err != nil {
-		fmt.Println("call ", modname+"."+method+" error:", err)
-		return nil, err
-	}
-
-	// 读N个返回值
-	rst := []string{}
-	for i := 1; i <= nret; i++ {
-		rst = append(rst, l.L.Get(-nret+i-1).String())
-	}
-	l.L.Pop(nret)
-	return rst, nil
-}
-
+// moduleNameFromFilename 由文件名推导模块名（去掉目录与 .lua 后缀）
 func moduleNameFromFilename(filename string) string {
-	filename = strings.TrimSuffix(filename, ".lua")
-	return filepath.Base(filename)
-}
-
-// make_fun 将Go函数绑定到Lua函数
-// 创建一个Lua函数，该函数调用指定的Go函数
-// 参数：
-//
-//	fptr any - 函数指针，用于存储创建的函数
-//	f any - Go函数
-func make_fun(fptr any, f any) {
-	// 检查fptr是否是指针类型
-	fn := reflect.ValueOf(fptr)
-	k := fn.Kind()
-	if k == reflect.Pointer {
-		fn = fn.Elem()
-	}
-	// 使用反射创建函数，该函数调用指定的Go函数
-	res := reflect.MakeFunc(fn.Type(), func(args []reflect.Value) []reflect.Value {
-		// 获取Lua状态
-		L := args[0].Interface().(*lua.LState)
-		// 获取Go函数的反射值和类型
-		vn := reflect.ValueOf(f)
-		tn := reflect.TypeOf(f)
-		// 准备参数
-		params := []reflect.Value{}
-		// 遍历所有输入参数，从Lua获取参数值
-		for i := 0; i < tn.NumIn(); i++ {
-			n := tn.In(i)
-			isPtr := n.Kind() == reflect.Pointer
-			if isPtr {
-				n = n.Elem()
-			}
-			// lua索引从1开始
-			params = append(params, getParam(L, n.Kind(), i+1))
-		}
-		// 调用Go函数，获取返回值
-		rst := vn.Call(params)
-		// 遍历所有返回值，转换为Lua值并压入栈
-		for _, v := range rst {
-			L.Push(getResult(v))
-		}
-		// 返回值数量
-		return []reflect.Value{reflect.ValueOf(len(rst))}
-	})
-	// 设置函数值
-	fn.Set(res)
-}
-
-// makeSum 将Go方法绑定到Lua函数
-// 创建一个Lua函数，该函数调用指定的Go方法
-// 参数：
-//
-//	fptr any - 函数指针，用于存储创建的函数
-//	m reflect.Method - Go方法
-//	v reflect.Value - 方法接收器
-func makeSum(fptr any, m reflect.Method, v reflect.Value) {
-	// 检查fptr是否是指针类型
-	fn := reflect.ValueOf(fptr)
-	k := fn.Kind()
-	if k == reflect.Pointer {
-		fn = fn.Elem()
-	}
-	// 使用反射创建函数，该函数调用指定的Go方法
-	res := reflect.MakeFunc(fn.Type(), func(args []reflect.Value) []reflect.Value {
-		// 获取Lua状态
-		L := args[0].Interface().(*lua.LState)
-		// 准备参数，第一个参数是接收器
-		params := []reflect.Value{v}
-		// 遍历所有输入参数（从1开始，因为0是接收器），从Lua获取参数值
-		for i := 1; i < m.Type.NumIn(); i++ {
-			n := m.Type.In(i)
-			isPtr := n.Kind() == reflect.Pointer
-			if isPtr {
-				n = n.Elem()
-			}
-			// 添加参数
-			params = append(params, getParam(L, n.Kind(), i))
-		}
-		// 调用Go方法，获取返回值
-		rst := m.Func.Call(params)
-		// 遍历所有返回值，转换为Lua值并压入栈
-		for _, v := range rst {
-			L.Push(getResult(v))
-		}
-		// 返回值数量
-		return []reflect.Value{reflect.ValueOf(len(rst))}
-	})
-	// 设置函数值
-	fn.Set(res)
-}
-
-// getResult 将Go值转换为Lua值
-// 根据Go值的类型，转换为对应的Lua值
-// 参数：
-//
-//	v reflect.Value - Go值的反射值
-//
-// 返回值：
-//
-//	lua.LValue - 转换后的Lua值
-func getResult(v reflect.Value) lua.LValue {
-	switch v.Kind() {
-	case reflect.Int:
-		// 转换int为lua.LNumber
-		return lua.LNumber(v.Interface().(int))
-	case reflect.String:
-		// 转换string为lua.LString
-		return lua.LString(v.Interface().(string))
-	default:
-		// 不支持的类型，抛出异常
-		panic("unsupported type")
-	}
-}
-
-// getParam 从Lua获取参数值，转换为Go值
-// 根据指定的类型，从Lua获取参数值并转换为对应的Go值
-// 参数：
-//
-//	L *lua.LState - Lua状态
-//	k reflect.Kind - Go类型
-//	pos int - Lua参数位置（从1开始）
-//
-// 返回值：
-//
-//	reflect.Value - 转换后的Go值的反射值
-func getParam(L *lua.LState, k reflect.Kind, pos int) reflect.Value {
-	switch k {
-	case reflect.Int:
-		// 从Lua获取int值
-		return reflect.ValueOf(L.ToInt(pos))
-	case reflect.String:
-		// 从Lua获取string值
-		return reflect.ValueOf(L.ToString(pos))
-	default:
-		// 不支持的类型，抛出异常
-		panic("unsupported type")
-	}
-}
-
-// getIns 获取一个空的Lua函数实例
-// 返回值：
-//
-//	lua.LGFunction - 空的Lua函数
-func getIns() lua.LGFunction {
-	var l func(*lua.LState) int
-	return l
-}
-
-// register_global 注册全局变量
-// 创建一个ServiceFuncs实例，存储服务的名称、接收器和方法
-// 参数：
-//
-//	rcvr any - 要注册的Go值
-//
-// 返回值：
-//
-//	*ServiceFuncs - 创建的ServiceFuncs实例
-func register_global(rcvr any) *ServiceFuncs {
-	service := new(ServiceFuncs)
-	// 获取类型和值
-	getType := reflect.TypeOf(rcvr)
-	service.V = reflect.ValueOf(rcvr)
-	k := getType.Kind()
-	// 处理指针类型
-	if k == reflect.Pointer {
-		el := getType.Elem()
-		// 生成服务名称：包路径.类型名称
-		sname := fmt.Sprintf("%s.%s", el.PkgPath(), el.Name())
-		service.N = sname
-	} else {
-		// 生成服务名称：包路径.类型名称
-		sname := fmt.Sprintf("%s.%s", getType.PkgPath(), getType.Name())
-		service.N = sname
-	}
-	// 安装方法
-	service.M = suitableMethods(getType)
-	return service
-}
-
-// suitableMethods 获取类型的所有导出方法
-// 遍历类型的所有方法，过滤出导出的方法（首字母大写）
-// 参数：
-//
-//	typ reflect.Type - 类型
-//
-// 返回值：
-//
-//	map[string]reflect.Method - 导出方法的映射
-func suitableMethods(typ reflect.Type) map[string]reflect.Method {
-	methods := make(map[string]reflect.Method)
-	// 遍历所有方法
-	for m := 0; m < typ.NumMethod(); m++ {
-		m := typ.Method(m)
-		// 跳过非导出方法（有包路径的方法）
-		if m.PkgPath != "" {
-			continue
-		}
-		// 跳过非导出方法（首字母小写）
-		if !m.IsExported() {
-			continue
-		}
-		// 添加到映射
-		methods[m.Name] = m
-	}
-	return methods
+	return filepath.Base(strings.TrimSuffix(filename, ".lua"))
 }

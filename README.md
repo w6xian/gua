@@ -17,6 +17,26 @@
 - 支持从 Go 调用 Lua 模块函数（Call/Call2/CallN）
 - 支持监听 Lua 文件变化并自动重载（WatchFile/WatchDir）
 
+## 稳定性保证
+
+- **并发安全**：`Luax` 所有方法内部串行化对 `*lua.LState` 的访问，可被多个 goroutine 同时使用
+- **不会崩溃宿主进程**：注册给 Lua 的 Go 函数发生 panic 时会被转换成 Lua 错误；`DoString`/`DoFile`/`LoadFile`/`Call*` 内部统一 recover
+- **关闭后安全**：`Close()` 幂等且可重复调用；关闭之后所有方法返回 `ErrClosed`（`errors.Is` 可判定），不再 panic
+- **类型安全**：Go 与 Lua 的值转换不再 panic，不支持的类型返回明确的错误
+
+### 类型转换支持
+
+| 方向 | 支持的类型 |
+| --- | --- |
+| Go -> Lua | bool、所有（无符号）整数、float32/64、string、slice/array、map、struct（仅导出字段）、指针/interface（自动解引用，nil 为 `nil`） |
+| Lua -> Go | bool、所有（无符号）整数、float32/64、string（数字字符串可转数字）、slice/array、map、struct、指针、空 interface |
+| 返回值 | 若返回值是 `error` 且非 nil，会转换为 Lua 错误；nil error 对应 `nil` |
+
+### 使用注意
+
+- 不要在注册给 Lua 的 Go 函数内部回调同一个 `Luax`（内部锁不可重入，会死锁），需要回调 Lua 时请使用入参里的 `*lua.LState`
+- 直接读写导出字段 `L` 不会加锁，需由调用方保证串行
+
 ## 安装
 
 ```bash
@@ -227,11 +247,28 @@ if err := L.WatchDir("modal"); err != nil {
 ### 核心方法
 
 #### NewState
-创建一个新的Lua状态机
+返回进程内共享的 Lua 状态机（单例）。首次调用时创建；实例被 Close 后再次调用会重新创建。
 
 ```go
 func NewState(options ...Option) *Luax
 ```
+
+#### New
+创建一个相互隔离的全新 Lua 状态机（非单例），适合测试或需要多环境的场景。
+
+```go
+func New(options ...Option) *Luax
+```
+
+#### Closed
+返回状态机是否已经关闭。
+
+```go
+func (l *Luax) Closed() bool
+```
+
+#### ErrClosed
+状态机关闭后所有方法返回的错误，可用 `errors.Is(err, gua.ErrClosed)` 判定。
 
 #### SetFunction
 注册全局函数
@@ -318,10 +355,34 @@ func (l *Luax) CallN(mn string, nret int, args ...string) ([]string, error)
 ```
 
 #### Close
-关闭Lua状态机
+关闭Lua状态机并停止文件监听。可重复调用（幂等），关闭后再调用其他方法会返回 `ErrClosed`。
 
 ```go
 func (l *Luax) Close()
+```
+
+### 并发使用示例
+
+```go
+L := gua.New(gua.CallStackSize(1024))
+defer L.Close()
+
+L.LoadFile("m.lua")
+
+var wg sync.WaitGroup
+for i := 0; i < 8; i++ {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := L.DoString("n = (n or 0) + 1"); err != nil {
+            log.Println(err)
+        }
+        if ret, err := L.Call("m.Test", "1", "2", "3"); err == nil {
+            _ = ret
+        }
+    }()
+}
+wg.Wait()
 ```
 
 ## 示例
